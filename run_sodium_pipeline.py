@@ -108,6 +108,7 @@ atlas_in_sodium_FNIRT = os.path.join(ARG3, f"{subject}_HarvardOxford_in_sodium_F
 
 mprage_optibrain_fast = os.path.join(ARG1, f"{subject}_MPRAGE_optibrain_pve_0.nii.gz")
 
+mprage2sodium_mat = os.path.join(ARG1, f"{subject}_mainmprage2sodium.mat")
 
 out_csv = os.path.join(ARG3, f"{subject}_ROIstats.csv")
 
@@ -672,6 +673,151 @@ def moveOutputs():
         else:
             print(f"⚠️ Missing file, skipping: {f}")
 
+def processFastMasksAndOutputs():
+    """After FAST maps are in sodium space, binarise/erode masks, apply to sodium, make MNI versions, and organise outputs."""
+    parent_dir = os.path.dirname(ARG1)
+    PVE_THRESHOLD = 0.5
+
+    # --- Binarise PVE masks already moved to sodium space ---
+    print("\n--- Processing FAST PVE masks in sodium space ---")
+    pve_masks = sorted(f for f in glob.glob(os.path.join(ARG1, "*fast_in_sodium_pve_*.nii.gz")) if "_bin" not in f)
+    if not pve_masks:
+        print("⚠️ No sodium-space FAST PVE masks found.")
+        return
+
+    binarised_masks = []
+    for pve_file in pve_masks:
+        bin_file = pve_file.replace(".nii.gz", "_bin.nii.gz")
+        if not os.path.exists(bin_file):
+            run([f"{FSLDIR}/bin/fslmaths", pve_file, "-thr", str(PVE_THRESHOLD), "-bin", bin_file])
+            print(f"✅ Binarised {pve_file} → {bin_file}")
+        binarised_masks.append(bin_file)
+
+    # --- Erode WM mask (PVE2) ---
+    print("\n--- Eroding WM (PVE2) mask ---")
+    for f in binarised_masks.copy():
+        if "_pve_2_bin.nii.gz" in f:
+            ero_file = f.replace(".nii.gz", "_ero.nii.gz")
+            if not os.path.exists(ero_file):
+                run([f"{FSLDIR}/bin/fslmaths", f, "-kernel", "sphere", "3.5", "-ero", ero_file])
+                print(f"✅ Eroded {f} → {ero_file}")
+            idx = binarised_masks.index(f)
+            binarised_masks[idx] = ero_file
+
+    # --- Apply each binary/eroded mask to sodium image ---
+    for mask in binarised_masks:
+        mask_base = os.path.basename(mask).replace(".nii.gz", "").replace("_bin", "").replace("_ero", "")
+        out_file = os.path.join(ARG3, f"{subject}_sodium_masked_{mask_base}.nii.gz")
+        if not os.path.exists(out_file):
+            run([f"{FSLDIR}/bin/fslmaths", sodium_file, "-mas", mask, out_file])
+            print(f"✅ Applied {mask_base} → {os.path.basename(out_file)}")
+
+    # --- Move FAST outputs to MNI space ---
+    print("\n--- Moving FAST outputs to MNI space ---")
+    fast_matches = glob.glob(os.path.join(ARG1, "*MPRAGE_optibrain_pve*.nii*"))
+    for fast_file in fast_matches:
+        base = os.path.basename(fast_file)
+        out_file = os.path.join(ARG3, base.replace("MPRAGE_optibrain", "fast_in_MNI"))
+        if not os.path.exists(out_file):
+            run([
+                f"{FSLDIR}/bin/flirt", "-in", fast_file, "-ref", MNI_TEMPLATE,
+                "-applyxfm", "-init", affine_mprage_to_mni,
+                "-interp", "nearestneighbour", "-out", out_file
+            ])
+            print(f"✅ Transformed {base} → {out_file}")
+
+    # --- Binarise & erode PVE masks in MNI space ---
+    print("\n--- Processing MNI-space FAST masks ---")
+    pve_masks_mni = sorted(f for f in glob.glob(os.path.join(ARG3, "*fast_in_MNI_pve_*.nii.gz")) if "_bin" not in f)
+    for pve_file in pve_masks_mni:
+        bin_file = pve_file.replace(".nii.gz", "_bin.nii.gz")
+        if not os.path.exists(bin_file):
+            run([f"{FSLDIR}/bin/fslmaths", pve_file, "-thr", str(PVE_THRESHOLD), "-bin", bin_file])
+        if "_pve_2_bin.nii.gz" in bin_file:
+            ero_file = bin_file.replace(".nii.gz", "_ero.nii.gz")
+            if not os.path.exists(ero_file):
+                run([f"{FSLDIR}/bin/fslmaths", bin_file, "-kernel", "sphere", "2", "-ero", ero_file])
+
+    # --- Organise outputs ---
+    # outputs_pve_native = os.path.join(parent_dir, "outputs_pve_native")
+    # os.makedirs(outputs_pve_native, exist_ok=True)
+    # for f in glob.glob(os.path.join(ARG1, "*fast_in_sodium_pve_*.nii*")):
+    #     shutil.copy(f, os.path.join(outputs_pve_native, os.path.basename(f)))
+
+
+    outputs_pve_native = os.path.join(parent_dir, "outputs_pve_native")
+    os.makedirs(outputs_pve_native, exist_ok=True)
+
+    # Move the masked sodium PVEs instead of the raw FAST maps
+    masked_pve_files = sorted(
+        glob.glob(os.path.join(ARG3, f"{subject}_sodium_masked_*fast_in_sodium_pve_*.nii*"))
+    )
+    if not masked_pve_files:
+        print("⚠️ No masked sodium PVE files found to move.")
+    else:
+        for f in masked_pve_files:
+            dest = os.path.join(outputs_pve_native, os.path.basename(f))
+            shutil.move(f, dest)
+            print(f"📦 Moved {os.path.basename(f)} → {outputs_pve_native}/")
+
+    outputs_pve_mni = os.path.join(parent_dir, "outputs_pve_mni")
+    os.makedirs(outputs_pve_mni, exist_ok=True)
+    for f in glob.glob(os.path.join(ARG3, "*fast_in_MNI_pve_*.nii*")):
+        shutil.copy(f, os.path.join(outputs_pve_mni, os.path.basename(f)))
+
+    # --- 7. Compute global PVE stats in native space ---
+    print("\n--- Processing PVE files with atlas ---")
+
+    pve_files = sorted(
+        glob.glob(os.path.join(outputs_pve_native, f"{subject}_sodium_masked_*fast_in_sodium_pve_*.nii*"))
+    )
+    if not pve_files:
+        print(f"⚠️ No PVE files found in {outputs_pve_native}")
+    else:
+        print(f"🧾 Found {len(pve_files)} PVE files:")
+        for f in pve_files:
+            print(f"  - {os.path.basename(f)}")
+
+        all_results = []
+        for f in pve_files:
+            if not os.path.exists(f):
+                print(f"⚠️ Missing PVE file: {f}")
+                continue
+            try:
+                img = nib.load(f)
+                data = img.get_fdata()
+                data = data[np.isfinite(data)]
+                data = data[data > 0]
+
+                mean_val = np.mean(data)
+                std_val = np.std(data)
+                median_val = np.median(data)
+                q75, q25 = np.percentile(data, [75, 25])
+                iqr_val = q75 - q25
+
+                all_results.append({
+                    "Filename": os.path.basename(f),
+                    "Mean": mean_val,
+                    "Std": std_val,
+                    "Median": median_val,
+                    "IQR": iqr_val
+                })
+                print(f"✅ Processed {os.path.basename(f)}")
+            except Exception as e:
+                print(f"❌ Failed on {f}: {e}")
+
+        # Combine and save summary
+        if all_results:
+            summary_csv = os.path.join(outputs_pve_native, "PVE_global_summary.csv")
+            pd.DataFrame(all_results).to_csv(summary_csv, index=False)
+            print(f"📊 Saved combined summary → {summary_csv}")
+        else:
+            print("⚠️ No PVE stats computed.")
+
+
+
+
+
 
 
 
@@ -699,6 +845,8 @@ if __name__ == "__main__":
 
     moveAtlasToSodium()
     #moveAtlasToSodium_FNIRT()
+
+    processFastMasksAndOutputs()
 
     roiTable()
 

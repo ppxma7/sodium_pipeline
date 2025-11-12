@@ -1,6 +1,6 @@
 #!/bin/bash
 
-mypath="/Users/ppzma/Documents/MATLAB/sodium_pipeline/"
+mypath="/Users/ppzma/Documents/MATLAB/mycode/"
 cd "$mypath" || exit
 source heph_venv/bin/activate
 
